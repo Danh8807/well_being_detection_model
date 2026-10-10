@@ -1,0 +1,28 @@
+# Raw data: never commit participant data (videos, survey, audio).
+Data/
+
+# Everything derived from participant data (labels, features, transcripts, embeddings).
+outputs/
+features_raw/
+
+# Media and array files, in case they end up outside Data/.
+*.mp4
+*.mov
+*.webm
+*.mkv
+*.avi
+*.wav
+*.npy
+*.npz
+*.pt
+*.pth
+
+# Python environment and caches.
+venv*/
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Editor settings.
+.vscode/
