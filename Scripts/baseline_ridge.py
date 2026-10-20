@@ -1,3 +1,4 @@
+import argparse
 import json
 import pathlib
 from typing import Dict, List
@@ -18,6 +19,7 @@ PROJECT_ROOT = pathlib.Path(__file__).resolve().parent.parent
 OUTPUT_DIRECTORY = PROJECT_ROOT / "outputs"
 FEATURE_DIRECTORY = OUTPUT_DIRECTORY / "features_raw"
 EMBEDDING_CACHE_PATH = OUTPUT_DIRECTORY / "text_embeddings.npz"
+DEFAULT_TEXT_MODEL = "sentence-transformers/all-mpnet-base-v2"
 
 ID_COLUMN = "ResponseId"
 TARGET_COLUMNS: List[str] = ["swls_score", "positive_affect_score", "negative_affect_score"]
@@ -57,17 +59,32 @@ def add_speech_statistics(table: pd.DataFrame) -> pd.DataFrame:
     return table
 
 
-def get_text_embeddings(table: pd.DataFrame) -> np.ndarray:
-    """Sentence embeddings of the transcripts, cached on disk because encoding takes minutes."""
+def get_text_embeddings(table: pd.DataFrame, model_name: str = DEFAULT_TEXT_MODEL) -> np.ndarray:
+    """Sentence embeddings of the transcripts, cached on disk (one cache file per model)."""
     identifiers = table[ID_COLUMN].to_numpy().astype(str)
-    if EMBEDDING_CACHE_PATH.exists():
-        cache = np.load(EMBEDDING_CACHE_PATH)
+    if model_name == DEFAULT_TEXT_MODEL:
+        cache_path = EMBEDDING_CACHE_PATH  # reuse the existing mpnet cache
+    else:
+        cache_path = OUTPUT_DIRECTORY / f"text_embeddings_{model_name.split('/')[-1]}.npz"
+    if cache_path.exists():
+        cache = np.load(cache_path)
         if np.array_equal(cache["identifiers"], identifiers):
             return cache["embeddings"]
-    model = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
+    model = SentenceTransformer(model_name)
     embeddings = model.encode(table["transcript"].fillna("").tolist(), batch_size=32, show_progress_bar=True)
-    np.savez(EMBEDDING_CACHE_PATH, identifiers=identifiers, embeddings=embeddings)
+    np.savez(cache_path, identifiers=identifiers, embeddings=embeddings)
     return embeddings
+
+
+def load_audio_embeddings(table: pd.DataFrame, name: str) -> np.ndarray:
+    """Audio embeddings (n_people, n_layers, dim), aligned to the rows of `table` by ID."""
+    data = np.load(OUTPUT_DIRECTORY / f"audio_emb_{name}.npz", allow_pickle=True)
+    position = {str(i): k for k, i in enumerate(data["ids"])}
+    identifiers = table[ID_COLUMN].astype(str).tolist()
+    missing = [i for i in identifiers if i not in position]
+    if missing:
+        raise SystemExit(f"Missing audio embedding for {len(missing)} people, e.g. {missing[:3]}")
+    return data["embeddings"][[position[i] for i in identifiers]]
 
 
 def concordance_correlation_coefficient(true_values: np.ndarray, predicted_values: np.ndarray) -> float:
@@ -140,14 +157,14 @@ def evaluate(name: str, model, feature_matrix: np.ndarray, target_matrix: np.nda
     return rows
 
 
-def main() -> None:
+def main(audio_name=None, layer=None, text_model: str = DEFAULT_TEXT_MODEL) -> None:
     dataset_table = pd.read_csv(OUTPUT_DIRECTORY / "dataset_all.csv")
     feature_table = add_speech_statistics(load_feature_table(dataset_table[ID_COLUMN].tolist()))
     merged_table = feature_table.merge(dataset_table, on=ID_COLUMN, how="inner").reset_index(drop=True)
     print(f"Participants with features: {len(merged_table)} of {len(dataset_table)}")
 
     # Embeddings are computed for everyone (no labels involved) and cached.
-    embedding_matrix = get_text_embeddings(merged_table)
+    embedding_matrix = get_text_embeddings(merged_table, text_model)
 
     # Only the train split is used from here on.
     is_train = (merged_table["split"] == "train").to_numpy()
@@ -160,21 +177,42 @@ def main() -> None:
     target_matrix = merged_table.loc[is_train, TARGET_COLUMNS].to_numpy(dtype=float)
     print(f"Train participants used for cross-validation: {len(target_matrix)}")
 
-    feature_sets = {
-        "speech_statistics": speech_matrix,
-        "acoustic_egemaps": acoustic_matrix,
-        "text_embedding": text_matrix,
-        "all_features": np.hstack([acoustic_matrix, speech_matrix, text_matrix]),
-    }
+    if audio_name is None:
+        feature_sets = {
+            "speech_statistics": speech_matrix,
+            "acoustic_egemaps": acoustic_matrix,
+            "text_embedding": text_matrix,
+            "all_features": np.hstack([acoustic_matrix, speech_matrix, text_matrix]),
+        }
+        output_name = "baseline_ridge_results.csv"
+    else:
+        audio_all = load_audio_embeddings(merged_table, audio_name)[is_train]
+        layers = range(audio_all.shape[1]) if layer is None else [layer]
+        feature_sets = {"text_embedding": text_matrix}
+        for l in layers:
+            feature_sets[f"{audio_name}_layer{l}_audio_only"] = audio_all[:, l]
+            feature_sets[f"{audio_name}_layer{l}_all_features"] = np.hstack(
+                [audio_all[:, l], speech_matrix, text_matrix]
+            )
+        output_name = f"baseline_ridge_results_{audio_name}.csv"
+
+    if text_model != DEFAULT_TEXT_MODEL:
+        output_name = output_name.replace(".csv", f"_text_{text_model.split('/')[-1]}.csv")
 
     result_rows = evaluate("mean_predictor", DummyRegressor(strategy="mean"), acoustic_matrix, target_matrix)
     for name, feature_matrix in feature_sets.items():
         result_rows += evaluate(name, build_ridge_model(), feature_matrix, target_matrix)
 
     results_table = pd.DataFrame(result_rows)
-    results_table.to_csv(OUTPUT_DIRECTORY / "baseline_ridge_results.csv", index=False)
+    results_table.to_csv(OUTPUT_DIRECTORY / output_name, index=False)
     print(results_table.round(3).to_string(index=False))
+    print("Saved", OUTPUT_DIRECTORY / output_name)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--audio_embedding", default=None, help="e.g. wavlm-base-plus")
+    parser.add_argument("--layer", type=int, default=None, help="one layer only; default tries all layers")
+    parser.add_argument("--text_model", default=DEFAULT_TEXT_MODEL, help="e.g. BAAI/bge-large-en-v1.5")
+    arguments = parser.parse_args()
+    main(arguments.audio_embedding, arguments.layer, arguments.text_model)
